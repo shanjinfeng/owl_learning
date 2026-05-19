@@ -5,6 +5,11 @@ import numpy as np
 import time
 import configparser
 
+# 获取当前脚本的绝对路径的上一级目录（即项目根目录）并加入到环境变量
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.insert(0, parent_dir)
+
 from utils.video_manager import VideoStream
 from utils.marker_detect import ArucoMarkerDetector
 from utils.output_manager import RelayController
@@ -63,6 +68,7 @@ class ArucoWeeder:
         
         # 喷头分布坐标
         self.nozzle_x_positions = [float(x.strip()) for x in self.config.get('Nozzles', 'x_positions').split(',')]
+        print(f"[System] 喷头 X 坐标 (m): {self.nozzle_x_positions}")
         
         # 继电器映射
         relay_dict = {}
@@ -138,9 +144,9 @@ class ArucoWeeder:
                     if marker_id in self.sprayed_markers:
                         continue
                         
-                    # 计算底部中心点 (针对贴地物体更精准)
+                    # 计算中心点像素坐标 (与 test_camera_aruco.py 保持一致)
                     cx = (x1 + x2) / 2.0
-                    cy = float(y2)
+                    cy = (y1 + y2) / 2.0
                     
                     # 像素映射物理距离 (m)
                     gx_m, gy_m = self.mapper.pixel_to_ground(cx, cy)
