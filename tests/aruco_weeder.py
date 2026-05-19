@@ -162,6 +162,9 @@ class ArucoWeeder:
                     # 2. 计算延迟
                     delay_s = total_dist / self.speed_mps
                     
+                    # 打印终端信息
+                    print(f"\r[Action] 识别 ID:{int(marker_id)} | 坐标: 右={gx_m*100:.1f}cm, 前={gy_m*100:.1f}cm | 匹配喷头: Relay {relay_id} | 延迟: {delay_s:.1f}s")
+
                     # 3. 调度 GPIO 动作
                     self.relay_controller.schedule_spray(
                         relay_id=relay_id, 
