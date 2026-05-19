@@ -172,15 +172,15 @@ class ArucoWeeder:
                     
                     # 2. 计算理想延迟时间 (如果不考虑系统延迟的情况)
                     ideal_delay_s = total_dist / self.speed_mps
-                    
+
                     # 3. 补偿系统耗时和物理延迟
                     # 实际需要等待的时间 = 理想延迟 - 图像处理花费的时间 - 继电器/电磁阀物理响应所需时间
                     adjusted_delay_s = ideal_delay_s - proc_time - self.relay_response_s
-                    
+
                     # 如果补偿后的延迟小于 0，说明由于车速快或处理慢，目标已经处于甚至越过了喷头正下方，需立即喷洒
                     if adjusted_delay_s < 0:
                         adjusted_delay_s = 0.0
-                    
+
                     # 打印终端信息
                     print(f"\r[Action] 识别 ID:{int(marker_id)} | 坐标: 右={gx_m*100:.1f}cm, 前={gy_m*100:.1f}cm | 匹配喷头: Relay {relay_id} | 理想延迟: {ideal_delay_s:.2f}s | 实际延迟: {adjusted_delay_s:.2f}s")
 
