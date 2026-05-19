@@ -221,10 +221,16 @@ def main():
                 
                 cv2.imshow("Optical Flow Speedometer", vis_img)
 
-            # 更新下一帧特征点
+            # 更新下一帧状态
             prev_gray = gray
             prev_time = current_time
-            prev_pts = cv2.goodFeaturesToTrack(gray, maxCorners=200, qualityLevel=0.05, minDistance=5, blockSize=7)
+            
+            # 判断成功追踪的内点数量
+            # 只有当追踪丢失或点太少时（比如低于30个），才触发耗时的全局特征点重新检测
+            if not is_bad_frame and len(good_next) > 30:
+                prev_pts = good_next.reshape(-1, 1, 2)
+            else:
+                prev_pts = cv2.goodFeaturesToTrack(gray, maxCorners=200, qualityLevel=0.05, minDistance=5, blockSize=7)
 
             # 按 Q 退出
             if cv2.waitKey(1) & 0xFF == ord('q'):
