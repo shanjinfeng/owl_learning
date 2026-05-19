@@ -129,7 +129,12 @@ class ArucoWeeder:
                 for box in boxes:
                     x1, y1, x2, y2, marker_id = box
                     
-                    # 已经喷洒过且在冷却期内，跳过
+                    # 无论是否喷洒过，都在图像上始终画出 Aruco 框和 ID
+                    cv2.rectangle(vis_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 3)
+                    cv2.putText(vis_frame, f"ID:{marker_id}", (int(x1), int(y1)-30), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                    
+                    # 已经喷洒过且在冷却期内，跳过 (防止重复触发喷嘴)
                     if marker_id in self.sprayed_markers:
                         continue
                         
@@ -161,11 +166,7 @@ class ArucoWeeder:
                     # 4. 记录防重喷
                     self.sprayed_markers[marker_id] = now
                     
-                    # 注：如果这里使用 print() 会导致终端画面换行滚动，使得上方的颜色块脱节
-                    # 因此为了界面的美观整洁，将文字转移至 CV2 画布内显示。
-                    
-                    # 可视化标注
-                    cv2.rectangle(vis_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 3)
+                    # 新增喷洒任务时，在框旁显示喷头和延迟信息
                     cv2.putText(vis_frame, f"N:{relay_id} D:{delay_s:.1f}s", (int(x1), int(y1)-10), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
