@@ -81,6 +81,7 @@ class DahengGigEStream:
         self.frame_width = resolution[0]
         self.frame_height = resolution[1]
         self.frame = None
+        self.frame_timestamp = None
 
         # 预热并获取第一帧
         warmup_deadline = time.time() + 2.0
@@ -145,6 +146,11 @@ class DahengGigEStream:
                     frame = cv2.resize(frame, (self.frame_width, self.frame_height))
 
                 self.frame = frame
+                # 记录帧被放入缓存的时间戳，用于时序计算
+                try:
+                    self.frame_timestamp = time.time()
+                except Exception:
+                    self.frame_timestamp = None
                 time.sleep(0.001)
         except Exception as e:
             self.logger.error(f'更新循环异常: {e}', exc_info=True)

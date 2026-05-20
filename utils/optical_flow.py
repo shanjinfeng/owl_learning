@@ -26,16 +26,30 @@ HISTORY_LEN = 15
 RANSAC_THRESHOLD_M = 0.03  # RANSAC 内点容忍误差(米)
 
 def configure_camera(cam):
-    """简单配置相机，开启自动白平衡和自动曝光"""
+    """配置相机参数以保证高帧率"""
+    # 开启自动白平衡
     for node_name in ["BalanceWhiteAuto", "BalanceWhiteAutoMode", "AWBMode"]:
         if hasattr(cam, node_name):
             try: cam.getattr(node_name).set(2)
             except: pass
+            
+    # 开启自动曝光
     if hasattr(cam, "ExposureAuto"):
         try: cam.ExposureAuto.set(2)
         except: pass
+        
+    # 【核心优化 1】强制限制自动曝光的最大时间为 20ms (保证物理极限最低 50 FPS)
+    # 如果环境比较暗，画面可能会变暗，但帧率能保证
+    if hasattr(cam, "AutoExposureTimeMax"):
+        try: cam.AutoExposureTimeMax.set(20000.0)
+        except: pass
+        
+    # 开启自动增益并放宽增益上限，以弥补曝光时间缩短带来的画面变暗
     if hasattr(cam, "GainAuto"):
         try: cam.GainAuto.set(2)
+        except: pass
+    if hasattr(cam, "AutoGainMax"):
+        try: cam.AutoGainMax.set(16.0)
         except: pass
 
 def pixel_to_world(u, v, H_inv):
@@ -79,7 +93,6 @@ def main():
     H = np.load(H_MATRIX_PATH)
     H_inv = np.linalg.inv(H)
     
-    # 建立车辆正前方和正右方向量
     p_bot = pixel_to_world(IMAGE_WIDTH / 2.0, IMAGE_HEIGHT, H_inv)
     p_top = pixel_to_world(IMAGE_WIDTH / 2.0, 0, H_inv)
     p_right_edge = pixel_to_world(IMAGE_WIDTH, IMAGE_HEIGHT, H_inv)
@@ -123,13 +136,21 @@ def main():
             raw = cam.data_stream[0].get_image()
             if raw is None: continue
             
-            arr = raw.convert("RGB").get_numpy_array()
-            frame = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+            # 【核心优化 2】直接获取 Numpy 原始���组，绕过缓慢的 SDK 软件插值
+            arr = raw.get_numpy_array()
+            
+            # 利用 OpenCV 的高度优化 C++ 库进行 Bayer 解码 (性能比 SDK 快数倍)
+            if len(arr.shape) == 2:
+                # 假设典型的拜耳阵列。即使颜色反了也不影响灰度光流计算
+                frame = cv2.cvtColor(arr, cv2.COLOR_BayerBG2BGR)
+            else:
+                frame = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+                
             current_time = time.time()
             dt = current_time - prev_time
             
-            # 降采样提速
-            frame_small = cv2.resize(frame, None, fx=DOWNSAMPLE_SCALE, fy=DOWNSAMPLE_SCALE, interpolation=cv2.INTER_AREA)
+            # 【核心优化 3】降采样提速，将缓慢的 INTER_AREA 换成更快的 INTER_LINEAR
+            frame_small = cv2.resize(frame, None, fx=DOWNSAMPLE_SCALE, fy=DOWNSAMPLE_SCALE, interpolation=cv2.INTER_LINEAR)
             gray = cv2.cvtColor(frame_small, cv2.COLOR_BGR2GRAY)
             vis_img = frame_small.copy()
 
@@ -155,31 +176,25 @@ def main():
                 is_bad_frame = True
 
                 if len(good_prev) > 0:
-                    # 画出光流轨迹 (在缩放图上)
                     for (p0, p1) in zip(good_prev, good_next):
                         a, b = int(p0[0]), int(p0[1])
                         c, d = int(p1[0]), int(p1[1])
                         cv2.line(vis_img, (a, b), (c, d), (0, 255, 0), 2)
                         cv2.circle(vis_img, (c, d), 3, (0, 0, 255), -1)
 
-                    # 1. 将特征点还原回原始尺寸 (因为 H 矩阵是用原图尺寸算的)
                     pts_prev_orig = good_prev / DOWNSAMPLE_SCALE
                     pts_next_orig = good_next / DOWNSAMPLE_SCALE
                     
-                    # 2. 批量将像素映射到物理地面 (毫米)
                     world_prev_mm = cv2.perspectiveTransform(pts_prev_orig.reshape(-1, 1, 2), H_inv).reshape(-1, 2)
                     world_next_mm = cv2.perspectiveTransform(pts_next_orig.reshape(-1, 1, 2), H_inv).reshape(-1, 2)
                     
-                    # 3. 计算位移 (毫米)
                     disp_world_mm = world_next_mm - world_prev_mm
                     
-                    # 4. 投影到向前的方向并转化为米 (注意：地面往后退，说明车往前走，所以加负号)
                     disp_fwd_m = -np.dot(disp_world_mm, vec_fwd) / 1000.0
                     disp_right_m = -np.dot(disp_world_mm, vec_right) / 1000.0
                     
                     phys_displacements = np.column_stack((disp_fwd_m, disp_right_m))
 
-                    # 5. RANSAC 过滤错误匹配
                     dx_m, dy_m, inliers_cnt = ransac_physical_translation(phys_displacements, threshold_m=RANSAC_THRESHOLD_M)
 
                     if inliers_cnt >= MIN_INLIERS:
@@ -205,14 +220,12 @@ def main():
                         vx *= 0.98
                         vy *= 0.98
 
-                # ================= HUD 绘制与终端输出 =================
+                # HUD 绘制与终端输出
                 status_txt = "NORMAL" if not is_bad_frame else f"PREDICT (Bad:{bad_frames})"
                 color = (0, 255, 0) if not is_bad_frame else (0, 165, 255)
                 
-                # 1. 终端输出预测速度
                 print(f"[SPEED] 向前: {vx:.3f} m/s | 向右: {vy:.3f} m/s | 状态: {status_txt} | 内点: {inliers_cnt}")
 
-                # 2. 绘制图像速度信息 (调小字体 scale 和 line_thickness)
                 fps = 1.0 / dt
                 cv2.putText(vis_img, f"Speed Fwd: {vx:.3f} m/s", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 cv2.putText(vis_img, f"Speed Right: {vy:.3f} m/s", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
@@ -221,12 +234,14 @@ def main():
                 
                 cv2.imshow("Optical Flow Speedometer", vis_img)
 
-            # 更新下一帧特征点
             prev_gray = gray
             prev_time = current_time
-            prev_pts = cv2.goodFeaturesToTrack(gray, maxCorners=200, qualityLevel=0.05, minDistance=5, blockSize=7)
+            
+            if not is_bad_frame and len(good_next) > 30:
+                prev_pts = good_next.reshape(-1, 1, 2)
+            else:
+                prev_pts = cv2.goodFeaturesToTrack(gray, maxCorners=200, qualityLevel=0.05, minDistance=5, blockSize=7)
 
-            # 按 Q 退出
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 

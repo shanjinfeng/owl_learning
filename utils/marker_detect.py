@@ -31,6 +31,11 @@ class ArucoMarkerDetector:
         
         self.last_corners = None
         self.last_ids = None
+        # 去抖参数：需要连续检测到多少帧才认为是真实目标
+        self.min_consecutive_frames = 1
+        # 连续检测计数与最后边界框缓存
+        self._consec_counts = {}
+        self._last_boxes = {}
     
     def predict(self, frame: np.ndarray) -> List[List[float]]:
         if len(frame.shape) == 3:
@@ -39,29 +44,47 @@ class ArucoMarkerDetector:
             gray = frame
         
         corners, ids, rejected = self.detector.detectMarkers(gray)
-        
+
         self.last_corners = corners
         self.last_ids = ids
-        
+
         boxes = []
-        
+
         if ids is None or len(ids) == 0:
+            # 没有检测到任何 id，重置连续计数
+            self._consec_counts.clear()
+            self._last_boxes.clear()
             return boxes
-        
+
+        seen_ids = set()
         for i, corner in enumerate(corners):
             points = corner[0]
-            
+
             x_min = float(np.min(points[:, 0]))
             y_min = float(np.min(points[:, 1]))
             x_max = float(np.max(points[:, 0]))
             y_max = float(np.max(points[:, 1]))
-            
+
             marker_id = int(ids[i][0])
-            
-            # 修复：将 marker_id 加入到返回列表中
-            box = [x_min, y_min, x_max, y_max, marker_id]
-            boxes.append(box)
-        
+            seen_ids.add(marker_id)
+
+            # 更新缓存边界框
+            self._last_boxes[marker_id] = [x_min, y_min, x_max, y_max, marker_id]
+            # 增加连续计数
+            self._consec_counts[marker_id] = self._consec_counts.get(marker_id, 0) + 1
+
+        # 将未在当前帧出现的 id 计数重置为 0
+        for old_id in list(self._consec_counts.keys()):
+            if old_id not in seen_ids:
+                self._consec_counts[old_id] = 0
+                if old_id in self._last_boxes:
+                    del self._last_boxes[old_id]
+
+        # 返回满足连续帧阈值的边界框
+        for mid, count in self._consec_counts.items():
+            if count >= self.min_consecutive_frames and mid in self._last_boxes:
+                boxes.append(self._last_boxes[mid])
+
         return boxes
     
     def predict_with_timing(self, frame: np.ndarray) -> Tuple[List[List[float]], float]:
