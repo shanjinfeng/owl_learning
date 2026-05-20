@@ -66,6 +66,10 @@ class ArucoWeeder:
         self.nozzle_offset = self.config.getfloat('System', 'nozzle_offset_m')
         self.track_timeout = self.config.getfloat('System', 'track_timeout_s')
         
+        # 新增：读取继电器物理响应时间补偿参数，如果没有配置则默认补偿 0.05 秒（50毫秒）
+        self.relay_response_s = self.config.getfloat('System', 'relay_response_s', fallback=0.05)
+        print(f"[System] 继电器物理响应补偿: {self.relay_response_s} 秒")
+        
         # 喷头分布坐标
         self.nozzle_x_positions = [float(x.strip()) for x in self.config.get('Nozzles', 'x_positions').split(',')]
         print(f"[System] 喷头 X 坐标 (m): {self.nozzle_x_positions}")
@@ -121,6 +125,9 @@ class ArucoWeeder:
 
         try:
             while True:
+                # 获取图像的同时，记录这一帧画面产生的时间
+                frame_capture_time = time.time()
+                
                 frame = self.camera.read()
                 if frame is None:
                     time.sleep(0.01)
@@ -128,6 +135,10 @@ class ArucoWeeder:
 
                 boxes = self.detector.predict(frame)
                 now = time.time()
+                
+                # 计算这帧图像经过模型推理等步骤耗费的时间（秒）
+                proc_time = now - frame_capture_time
+                
                 self.clean_old_tracks()
 
                 vis_frame = frame.copy()
@@ -159,24 +170,32 @@ class ArucoWeeder:
                     # 1. 匹配喷头
                     relay_id = self.get_nearest_nozzle(gx_m)
                     
-                    # 2. 计算延迟
-                    delay_s = total_dist / self.speed_mps
+                    # 2. 计算理想延迟时间 (如果不考虑系统延迟的情况)
+                    ideal_delay_s = total_dist / self.speed_mps
+                    
+                    # 3. 补偿系统耗时和物理延迟
+                    # 实际需要等待的时间 = 理想延迟 - 图像处理花费的时间 - 继电器/电磁阀物理响应所需时间
+                    adjusted_delay_s = ideal_delay_s - proc_time - self.relay_response_s
+                    
+                    # 如果补偿后的延迟小于 0，说明由于车速快或处理慢，目标已经处于甚至越过了喷头正下方，需立即喷洒
+                    if adjusted_delay_s < 0:
+                        adjusted_delay_s = 0.0
                     
                     # 打印终端信息
-                    print(f"\r[Action] 识别 ID:{int(marker_id)} | 坐标: 右={gx_m*100:.1f}cm, 前={gy_m*100:.1f}cm | 匹配喷头: Relay {relay_id} | 延迟: {delay_s:.1f}s")
+                    print(f"\r[Action] 识别 ID:{int(marker_id)} | 坐标: 右={gx_m*100:.1f}cm, 前={gy_m*100:.1f}cm | 匹配喷头: Relay {relay_id} | 理想延迟: {ideal_delay_s:.2f}s | 实际延迟: {adjusted_delay_s:.2f}s")
 
-                    # 3. 调度 GPIO 动作
+                    # 4. 调度 GPIO 动作 (使用补偿后的精确延迟时间)
                     self.relay_controller.schedule_spray(
                         relay_id=relay_id, 
-                        delay_s=delay_s, 
+                        delay_s=adjusted_delay_s, 
                         duration_s=self.spray_duration
                     )
                     
-                    # 4. 记录防重喷
+                    # 5. 记录防重喷 (这里记录为现在的绝对时间，避免短时间内被再次触发)
                     self.sprayed_markers[marker_id] = now
                     
                     # 新增喷洒任务时，在框旁显示喷头和延迟信息
-                    cv2.putText(vis_frame, f"N:{relay_id} D:{delay_s:.1f}s", (int(x1), int(y1)-10), 
+                    cv2.putText(vis_frame, f"N:{relay_id} D:{adjusted_delay_s:.2f}s", (int(x1), int(y1)-10), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
                 # 显示图像 (缩小显示)
