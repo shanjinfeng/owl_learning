@@ -14,7 +14,7 @@ from utils.video_manager import VideoStream
 from utils.marker_detect import ArucoMarkerDetector
 from utils.output_manager import RelayController
 from utils.vis_manager import RelayVis
-from utils.tracker_helpers import CropMaskStabilizer
+from utils.tracker import CropMaskStabilizer
 
 class GroundCoordinateMapperIPM:
     """逆透视映射器：提取物理坐标"""
@@ -42,6 +42,9 @@ class GroundCoordinateMapperIPM:
         vec_right_ortho = vec_right_raw - np.dot(vec_right_raw, self.vec_fwd) * self.vec_fwd
         self.vec_right = vec_right_ortho / np.linalg.norm(vec_right_ortho)
 
+        # 用于将地面物理坐标反投影回图像像素
+        self.H = np.linalg.inv(self.H_inv)
+
     # 私有方法：像素坐标转换为原始物理坐标
     def _get_raw_coords(self, u: float, v: float) -> tuple[float, float]:
         w = self.H_inv[2, 0] * u + self.H_inv[2, 1] * v + self.H_inv[2, 2]
@@ -57,6 +60,23 @@ class GroundCoordinateMapperIPM:
         right_dist_m = np.dot(vec_target, self.vec_right) / 1000.0
         forward_dist_m = np.dot(vec_target, self.vec_fwd) / 1000.0
         return float(right_dist_m), float(forward_dist_m)
+
+    def relative_to_pixel(self, x_right_m: float, y_forward_m: float) -> tuple[float, float] | None:
+        """相对地面坐标 (m) -> 图像像素坐标。"""
+        # 相对坐标先回到原始物理坐标系（mm）
+        p_raw = self.p_bot + (x_right_m * 1000.0) * self.vec_right + (y_forward_m * 1000.0) * self.vec_fwd
+        x_raw = float(p_raw[0])
+        y_raw = float(p_raw[1])
+
+        # 再用单应矩阵投影到像素平面
+        w = self.H[2, 0] * x_raw + self.H[2, 1] * y_raw + self.H[2, 2]
+        if abs(w) < 1e-9:
+            return None
+        u = (self.H[0, 0] * x_raw + self.H[0, 1] * y_raw + self.H[0, 2]) / w
+        v = (self.H[1, 0] * x_raw + self.H[1, 1] * y_raw + self.H[1, 2]) / w
+        if not np.isfinite(u) or not np.isfinite(v):
+            return None
+        return float(u), float(v)
 
 class ArucoWeeder:
     def __init__(self, config_path='config/aruco_weeding.ini'):
@@ -75,14 +95,36 @@ class ArucoWeeder:
         self.relay_response_s = self.config.getfloat('System', 'relay_response_s', fallback=0.05)
         print(f"[System] 继电器物理响应补偿: {self.relay_response_s} 秒")
         
-        # 喷头分布坐标
-        self.nozzle_x_positions = [float(x.strip()) for x in self.config.get('Nozzles', 'x_positions').split(',')]
-        print(f"[System] 喷头 X 坐标 (m): {self.nozzle_x_positions}")
-        
         # 继电器映射
         relay_dict = {}
         for key, value in self.config['Relays'].items():
             relay_dict[int(key)] = int(value)
+
+        # 车道/喷头分配：将逆透视后的 X 视野平均分成 lane_count 份，
+        # 每个车道中心对应一个喷头，二维码按所在车道分配喷头。
+        self.relay_ids = sorted(relay_dict.keys())
+        self.lane_count = self.config.getint('Nozzles', 'lane_count', fallback=len(self.relay_ids))
+        if self.lane_count <= 0:
+            self.lane_count = len(self.relay_ids)
+
+        self.fov_ground_width_m = self.config.getfloat('Nozzles', 'fov_ground_width_m', fallback=1.2)
+        half_w = self.fov_ground_width_m / 2.0
+        self.lane_x_bounds = np.linspace(-half_w, half_w, self.lane_count + 1).tolist()
+        self.nozzle_x_positions = [
+            0.5 * (self.lane_x_bounds[i] + self.lane_x_bounds[i + 1])
+            for i in range(self.lane_count)
+        ]
+
+        if len(self.relay_ids) != self.lane_count:
+            print(f"[System] 警告: relay 数量({len(self.relay_ids)}) 与 lane_count({self.lane_count}) 不一致，按较小值匹配。")
+            use_n = min(len(self.relay_ids), self.lane_count)
+            self.relay_ids = self.relay_ids[:use_n]
+            self.lane_count = use_n
+            self.lane_x_bounds = self.lane_x_bounds[:self.lane_count + 1]
+            self.nozzle_x_positions = self.nozzle_x_positions[:self.lane_count]
+
+        print(f"[System] 逆透视车道边界 X (m): {self.lane_x_bounds}")
+        print(f"[System] 车道中心/喷头 X (m): {self.nozzle_x_positions}")
             
         # 初始化终端可视化管理器
         self.vis = RelayVis(relays=len(relay_dict))
@@ -93,6 +135,8 @@ class ArucoWeeder:
         # 初始化 IPM 映射器
         matrix_path = self.config.get('System', 'ipm_matrix_path')
         self.mapper = GroundCoordinateMapperIPM(matrix_path, self.res[0], self.res[1])
+        top_center = self.mapper.pixel_to_ground(self.res[0] / 2.0, 0.0)
+        self.lane_vis_y_end_m = max(0.1, top_center[1])
         
         # 初始化视觉组件
         self.detector = ArucoMarkerDetector()
@@ -105,15 +149,23 @@ class ArucoWeeder:
         self.sprayed_markers = {}
 
     def get_nearest_nozzle(self, target_x_m: float) -> int:
-        """根据 X 坐标(向右为正)分派最近的喷头"""
-        best_idx = 0
-        min_dist = float('inf')
-        for i, nx in enumerate(self.nozzle_x_positions):
-            dist = abs(target_x_m - nx)
-            if dist < min_dist:
-                min_dist = dist
-                best_idx = i
-        return best_idx
+        """根据逆透视后的 X 坐标判断车道，并返回对应喷头 relay_id。"""
+        if self.lane_count <= 1:
+            return self.relay_ids[0]
+
+        # 落在视野外时，夹紧到最左/最右车道
+        if target_x_m <= self.lane_x_bounds[0]:
+            lane_idx = 0
+        elif target_x_m >= self.lane_x_bounds[-1]:
+            lane_idx = self.lane_count - 1
+        else:
+            lane_idx = 0
+            for i in range(self.lane_count):
+                if self.lane_x_bounds[i] <= target_x_m < self.lane_x_bounds[i + 1]:
+                    lane_idx = i
+                    break
+
+        return self.relay_ids[lane_idx]
 
     def clean_old_tracks(self):
         """清理过期的历史记录"""
@@ -122,6 +174,34 @@ class ArucoWeeder:
         expired = [m_id for m_id, completion_t in self.sprayed_markers.items() if now > completion_t + self.track_timeout]
         for m_id in expired:
             del self.sprayed_markers[m_id]
+
+    def draw_lane_overlay(self, frame):
+        """在画面中绘制逆透视 X 等分后的车道线。"""
+        h, w = frame.shape[:2]
+
+        for i, x_bound_m in enumerate(self.lane_x_bounds):
+            p0 = self.mapper.relative_to_pixel(x_bound_m, 0.0)
+            p1 = self.mapper.relative_to_pixel(x_bound_m, self.lane_vis_y_end_m)
+            if p0 is None or p1 is None:
+                continue
+
+            u0, v0 = p0
+            u1, v1 = p1
+            if not (-2 * w <= u0 <= 3 * w and -2 * h <= v0 <= 3 * h and -2 * w <= u1 <= 3 * w and -2 * h <= v1 <= 3 * h):
+                continue
+
+            thickness = 3 if i in (0, len(self.lane_x_bounds) - 1) else 2
+            cv2.line(frame, (int(u0), int(v0)), (int(u1), int(v1)), (255, 255, 0), thickness)
+
+        text_y_forward = min(self.lane_vis_y_end_m * 0.15, 0.3)
+        for i, x_center_m in enumerate(self.nozzle_x_positions):
+            p_txt = self.mapper.relative_to_pixel(x_center_m, text_y_forward)
+            if p_txt is None:
+                continue
+            u, v = p_txt
+            if -w <= u <= 2 * w and -h <= v <= 2 * h:
+                cv2.putText(frame, f"L{i} R{self.relay_ids[i]}", (int(u) - 30, int(v) - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
     def run(self):
         print("[System] 正在启动相机...")
@@ -153,6 +233,7 @@ class ArucoWeeder:
                 self.clean_old_tracks()
 
                 vis_frame = frame.copy()
+                self.draw_lane_overlay(vis_frame)
 
                 marker_ids = []
                 marker_boxes = []

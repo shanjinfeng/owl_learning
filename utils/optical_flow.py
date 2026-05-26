@@ -10,11 +10,10 @@ import sys
 try:
     import gxipy as gx
 except ImportError:
-    print("[ERROR] 无法导入 gxipy，请先安装大恒 Galaxy SDK Python 绑定。")
-    sys.exit(1)
+    gx = None
 
 # ================= 核心配置 =================
-H_MATRIX_PATH = "/home/sjf/owl/calibration/calibration/H.npy"
+H_MATRIX_PATH = "/home/jetson/Downloads/owl/calibration/calibration/H.npy"
 DOWNSAMPLE_SCALE = 0.25  # 降采样比例，提升光流计算速度
 IMAGE_WIDTH = 2048
 IMAGE_HEIGHT = 1536
@@ -84,163 +83,247 @@ def ransac_physical_translation(displacements_m, max_iter=30, threshold_m=0.03):
 
     return best_dx, best_dy, best_inliers
 
+
+class OpticalFlowSpeedometer:
+    def __init__(
+        self,
+        h_matrix_path=H_MATRIX_PATH,
+        downsample_scale=DOWNSAMPLE_SCALE,
+        image_width=IMAGE_WIDTH,
+        image_height=IMAGE_HEIGHT,
+        min_inliers=MIN_INLIERS,
+        max_bad_frames=MAX_BAD_FRAMES,
+        history_len=HISTORY_LEN,
+        ransac_threshold_m=RANSAC_THRESHOLD_M,
+        max_corners=200,
+        quality_level=0.05,
+        min_distance=5,
+    ):
+        self.downsample_scale = downsample_scale
+        self.image_width = image_width
+        self.image_height = image_height
+        self.min_inliers = min_inliers
+        self.max_bad_frames = max_bad_frames
+        self.ransac_threshold_m = ransac_threshold_m
+        self.max_corners = max_corners
+        self.quality_level = quality_level
+        self.min_distance = min_distance
+
+        if not os.path.exists(h_matrix_path):
+            raise FileNotFoundError(f"找不到 {h_matrix_path}")
+
+        H = np.load(h_matrix_path)
+        self.H_inv = np.linalg.inv(H)
+
+        p_bot = pixel_to_world(image_width / 2.0, image_height, self.H_inv)
+        p_top = pixel_to_world(image_width / 2.0, 0, self.H_inv)
+        p_right_edge = pixel_to_world(image_width, image_height, self.H_inv)
+
+        vec_fwd_raw = np.array(p_top) - np.array(p_bot)
+        self.vec_fwd = vec_fwd_raw / np.linalg.norm(vec_fwd_raw)
+
+        vec_right_raw = np.array(p_right_edge) - np.array(p_bot)
+        vec_right_ortho = vec_right_raw - np.dot(vec_right_raw, self.vec_fwd) * self.vec_fwd
+        self.vec_right = vec_right_ortho / np.linalg.norm(vec_right_ortho)
+
+        self.prev_gray = None
+        self.prev_pts = None
+        self.prev_time = None
+        self.vx_history = collections.deque(maxlen=history_len)
+        self.vy_history = collections.deque(maxlen=history_len)
+        self.prev_vx = 0.0
+        self.prev_vy = 0.0
+        self.bad_frames = 0
+
+    def update(self, frame):
+        current_time = time.time()
+        frame_small = cv2.resize(
+            frame,
+            None,
+            fx=self.downsample_scale,
+            fy=self.downsample_scale,
+            interpolation=cv2.INTER_LINEAR,
+        )
+        gray = cv2.cvtColor(frame_small, cv2.COLOR_BGR2GRAY)
+        vis_img = frame_small.copy()
+
+        if self.prev_gray is None or self.prev_pts is None or len(self.prev_pts) == 0:
+            self.prev_gray = gray
+            self.prev_time = current_time
+            self.prev_pts = cv2.goodFeaturesToTrack(
+                gray,
+                maxCorners=self.max_corners,
+                qualityLevel=self.quality_level,
+                minDistance=self.min_distance,
+                blockSize=7,
+            )
+            return {
+                'ready': False,
+                'speed_fwd': 0.0,
+                'speed_right': 0.0,
+                'inliers_cnt': 0,
+                'is_bad_frame': True,
+                'status_txt': 'INIT',
+                'dt': 0.0,
+                'vis_img': vis_img,
+                'good_next': None,
+            }
+
+        dt = current_time - (self.prev_time or current_time)
+        if dt <= 0:
+            self.prev_gray = gray
+            self.prev_time = current_time
+            return {
+                'ready': False,
+                'speed_fwd': 0.0,
+                'speed_right': 0.0,
+                'inliers_cnt': 0,
+                'is_bad_frame': True,
+                'status_txt': 'INVALID_DT',
+                'dt': 0.0,
+                'vis_img': vis_img,
+                'good_next': None,
+            }
+
+        next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            self.prev_gray, gray, self.prev_pts, None,
+            winSize=(21, 21), maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.001)
+        )
+
+        vx, vy = 0.0, 0.0
+        inliers_cnt = 0
+        is_bad_frame = True
+        good_next = None
+
+        if next_pts is not None and status is not None:
+            good_prev = self.prev_pts[status.flatten() == 1].reshape(-1, 2)
+            good_next = next_pts[status.flatten() == 1].reshape(-1, 2)
+
+            if len(good_prev) > 0:
+                for (p0, p1) in zip(good_prev, good_next):
+                    a, b = int(p0[0]), int(p0[1])
+                    c, d = int(p1[0]), int(p1[1])
+                    cv2.line(vis_img, (a, b), (c, d), (0, 255, 0), 2)
+                    cv2.circle(vis_img, (c, d), 3, (0, 0, 255), -1)
+
+                pts_prev_orig = good_prev / self.downsample_scale
+                pts_next_orig = good_next / self.downsample_scale
+
+                world_prev_mm = cv2.perspectiveTransform(
+                    pts_prev_orig.reshape(-1, 1, 2), self.H_inv
+                ).reshape(-1, 2)
+                world_next_mm = cv2.perspectiveTransform(
+                    pts_next_orig.reshape(-1, 1, 2), self.H_inv
+                ).reshape(-1, 2)
+
+                disp_world_mm = world_next_mm - world_prev_mm
+                disp_fwd_m = -np.dot(disp_world_mm, self.vec_fwd) / 1000.0
+                disp_right_m = -np.dot(disp_world_mm, self.vec_right) / 1000.0
+                phys_displacements = np.column_stack((disp_fwd_m, disp_right_m))
+
+                dx_m, dy_m, inliers_cnt = ransac_physical_translation(
+                    phys_displacements,
+                    threshold_m=self.ransac_threshold_m,
+                )
+
+                if inliers_cnt >= self.min_inliers:
+                    vx = dx_m / dt
+                    vy = dy_m / dt
+                    is_bad_frame = False
+                    self.vx_history.append(vx)
+                    self.vy_history.append(vy)
+                    self.prev_vx, self.prev_vy = vx, vy
+                    self.bad_frames = 0
+
+        if is_bad_frame:
+            self.bad_frames += 1
+            if len(self.vx_history) >= 3:
+                vx = float(np.mean(self.vx_history))
+                vy = float(np.mean(self.vy_history))
+            else:
+                vx, vy = self.prev_vx, self.prev_vy
+
+            if self.bad_frames > self.max_bad_frames:
+                vx *= 0.98
+                vy *= 0.98
+
+        status_txt = 'NORMAL' if not is_bad_frame else f'PREDICT (Bad:{self.bad_frames})'
+
+        self.prev_gray = gray
+        self.prev_time = current_time
+
+        if not is_bad_frame and good_next is not None and len(good_next) > 30:
+            self.prev_pts = good_next.reshape(-1, 1, 2)
+        else:
+            self.prev_pts = cv2.goodFeaturesToTrack(
+                gray,
+                maxCorners=self.max_corners,
+                qualityLevel=self.quality_level,
+                minDistance=self.min_distance,
+                blockSize=7,
+            )
+
+        return {
+            'ready': True,
+            'speed_fwd': float(vx),
+            'speed_right': float(vy),
+            'inliers_cnt': int(inliers_cnt),
+            'is_bad_frame': bool(is_bad_frame),
+            'status_txt': status_txt,
+            'dt': float(dt),
+            'vis_img': vis_img,
+            'good_next': good_next,
+        }
+
 def main():
-    # ========== 1. 加载单应性矩阵与坐标系 ==========
-    if not os.path.exists(H_MATRIX_PATH):
-        print(f"[ERROR] 找不到 {H_MATRIX_PATH}，请确认标定文件存在！")
+    if gx is None:
+        print("[ERROR] 无法导入 gxipy，请先安装大恒 Galaxy SDK Python 绑定。")
         return
-    
-    H = np.load(H_MATRIX_PATH)
-    H_inv = np.linalg.inv(H)
-    
-    p_bot = pixel_to_world(IMAGE_WIDTH / 2.0, IMAGE_HEIGHT, H_inv)
-    p_top = pixel_to_world(IMAGE_WIDTH / 2.0, 0, H_inv)
-    p_right_edge = pixel_to_world(IMAGE_WIDTH, IMAGE_HEIGHT, H_inv)
 
-    vec_fwd_raw = np.array(p_top) - np.array(p_bot)
-    vec_fwd = vec_fwd_raw / np.linalg.norm(vec_fwd_raw)
-    
-    vec_right_raw = np.array(p_right_edge) - np.array(p_bot)
-    vec_right_ortho = vec_right_raw - np.dot(vec_right_raw, vec_fwd) * vec_fwd
-    vec_right = vec_right_ortho / np.linalg.norm(vec_right_ortho)
-
-    # ========== 2. 初始化大恒相机 ==========
     manager = gx.DeviceManager()
     dev_num, _ = manager.update_device_list()
     if dev_num == 0:
         print("[ERROR] 未发现大恒 GigE 相机！")
         return
-    
+
     cam = manager.open_device_by_index(1)
     configure_camera(cam)
     cam.stream_on()
     print("[INFO] 相机已启动，开始光流测速...")
 
-    # ========== 3. 状态与历史变量 ==========
-    prev_gray = None
-    prev_pts = None
-    prev_time = time.time()
-    
-    vx_history = collections.deque(maxlen=HISTORY_LEN)
-    vy_history = collections.deque(maxlen=HISTORY_LEN)
-    prev_vx, prev_vy = 0.0, 0.0
-    bad_frames = 0
-    
+    speedometer = OpticalFlowSpeedometer()
     cv2.namedWindow("Optical Flow Speedometer", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Optical Flow Speedometer", 1024, 768)
 
-    # ========== 4. 主循环 ==========
     try:
         while True:
-            # 抓取图像
             raw = cam.data_stream[0].get_image()
-            if raw is None: continue
-            
-            # 【核心优化 2】直接获取 Numpy 原始���组，绕过缓慢的 SDK 软件插值
+            if raw is None:
+                continue
+
             arr = raw.get_numpy_array()
-            
-            # 利用 OpenCV 的高度优化 C++ 库进行 Bayer 解码 (性能比 SDK 快数倍)
+
             if len(arr.shape) == 2:
-                # 假设典型的拜耳阵列。即使颜色反了也不影响灰度光流计算
                 frame = cv2.cvtColor(arr, cv2.COLOR_BayerBG2BGR)
             else:
                 frame = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-                
-            current_time = time.time()
-            dt = current_time - prev_time
-            
-            # 【核心优化 3】降采样提速，将缓慢的 INTER_AREA 换成更快的 INTER_LINEAR
-            frame_small = cv2.resize(frame, None, fx=DOWNSAMPLE_SCALE, fy=DOWNSAMPLE_SCALE, interpolation=cv2.INTER_LINEAR)
-            gray = cv2.cvtColor(frame_small, cv2.COLOR_BGR2GRAY)
-            vis_img = frame_small.copy()
 
-            if prev_gray is None or prev_pts is None or len(prev_pts) == 0:
-                prev_gray = gray
-                prev_time = current_time
-                prev_pts = cv2.goodFeaturesToTrack(gray, maxCorners=200, qualityLevel=0.05, minDistance=5, blockSize=7)
-                continue
+            result = speedometer.update(frame)
+            vis_img = result['vis_img']
 
-            if dt > 0:
-                # KLT 光流追踪
-                next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
-                    prev_gray, gray, prev_pts, None,
-                    winSize=(21, 21), maxLevel=3,
-                    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.001)
+            if result['ready']:
+                fps = 1.0 / result['dt'] if result['dt'] > 0 else 0.0
+                print(
+                    f"[SPEED] 向前: {result['speed_fwd']:.3f} m/s | 向右: {result['speed_right']:.3f} m/s | "
+                    f"状态: {result['status_txt']} | 内点: {result['inliers_cnt']}"
                 )
+                cv2.putText(vis_img, f"Speed Fwd: {result['speed_fwd']:.3f} m/s", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv2.putText(vis_img, f"Speed Right: {result['speed_right']:.3f} m/s", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv2.putText(vis_img, f"Status: {result['status_txt']}", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0) if not result['is_bad_frame'] else (0, 165, 255), 2)
+                cv2.putText(vis_img, f"Inliers: {result['inliers_cnt']} | FPS: {fps:.1f}", (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-                good_prev = prev_pts[status.flatten() == 1].reshape(-1, 2)
-                good_next = next_pts[status.flatten() == 1].reshape(-1, 2)
-
-                vx, vy = 0.0, 0.0
-                inliers_cnt = 0
-                is_bad_frame = True
-
-                if len(good_prev) > 0:
-                    for (p0, p1) in zip(good_prev, good_next):
-                        a, b = int(p0[0]), int(p0[1])
-                        c, d = int(p1[0]), int(p1[1])
-                        cv2.line(vis_img, (a, b), (c, d), (0, 255, 0), 2)
-                        cv2.circle(vis_img, (c, d), 3, (0, 0, 255), -1)
-
-                    pts_prev_orig = good_prev / DOWNSAMPLE_SCALE
-                    pts_next_orig = good_next / DOWNSAMPLE_SCALE
-                    
-                    world_prev_mm = cv2.perspectiveTransform(pts_prev_orig.reshape(-1, 1, 2), H_inv).reshape(-1, 2)
-                    world_next_mm = cv2.perspectiveTransform(pts_next_orig.reshape(-1, 1, 2), H_inv).reshape(-1, 2)
-                    
-                    disp_world_mm = world_next_mm - world_prev_mm
-                    
-                    disp_fwd_m = -np.dot(disp_world_mm, vec_fwd) / 1000.0
-                    disp_right_m = -np.dot(disp_world_mm, vec_right) / 1000.0
-                    
-                    phys_displacements = np.column_stack((disp_fwd_m, disp_right_m))
-
-                    dx_m, dy_m, inliers_cnt = ransac_physical_translation(phys_displacements, threshold_m=RANSAC_THRESHOLD_M)
-
-                    if inliers_cnt >= MIN_INLIERS:
-                        vx = dx_m / dt
-                        vy = dy_m / dt
-                        is_bad_frame = False
-                        
-                        vx_history.append(vx)
-                        vy_history.append(vy)
-                        prev_vx, prev_vy = vx, vy
-                        bad_frames = 0
-
-                # 坏帧处理
-                if is_bad_frame:
-                    bad_frames += 1
-                    if len(vx_history) >= 3:
-                        vx = float(np.mean(vx_history))
-                        vy = float(np.mean(vy_history))
-                    else:
-                        vx, vy = prev_vx, prev_vy
-                        
-                    if bad_frames > MAX_BAD_FRAMES:
-                        vx *= 0.98
-                        vy *= 0.98
-
-                # HUD 绘制与终端输出
-                status_txt = "NORMAL" if not is_bad_frame else f"PREDICT (Bad:{bad_frames})"
-                color = (0, 255, 0) if not is_bad_frame else (0, 165, 255)
-                
-                print(f"[SPEED] 向前: {vx:.3f} m/s | 向右: {vy:.3f} m/s | 状态: {status_txt} | 内点: {inliers_cnt}")
-
-                fps = 1.0 / dt
-                cv2.putText(vis_img, f"Speed Fwd: {vx:.3f} m/s", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                cv2.putText(vis_img, f"Speed Right: {vy:.3f} m/s", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                cv2.putText(vis_img, f"Status: {status_txt}", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                cv2.putText(vis_img, f"Inliers: {inliers_cnt} | FPS: {fps:.1f}", (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-                
-                cv2.imshow("Optical Flow Speedometer", vis_img)
-
-            prev_gray = gray
-            prev_time = current_time
-            
-            if not is_bad_frame and len(good_next) > 30:
-                prev_pts = good_next.reshape(-1, 1, 2)
-            else:
-                prev_pts = cv2.goodFeaturesToTrack(gray, maxCorners=200, qualityLevel=0.05, minDistance=5, blockSize=7)
+            cv2.imshow("Optical Flow Speedometer", vis_img)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break

@@ -83,7 +83,7 @@ def main():
     
     # 1. 配置参数
     RESOLUTION = (2048, 1536) # 大恒相机常用分辨率
-    matrix_file_path = "/home/sjf/owl/calibration/calibration/H.npy"
+    matrix_file_path = "/home/jetson/Downloads/owl/calibration/calibration/H.npy"
     
     mapper = GroundCoordinateMapperIPM(
         matrix_path=matrix_file_path, 

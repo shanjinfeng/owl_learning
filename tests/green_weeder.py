@@ -14,7 +14,7 @@ from utils.video_manager import VideoStream
 from utils.greenonbrown import GreenOnBrown
 from utils.output_manager import RelayController
 from utils.vis_manager import RelayVis
-from utils.tracker_helpers import CropMaskStabilizer
+from utils.tracker import CropMaskStabilizer
 
 
 class GroundCoordinateMapperIPM:
@@ -75,14 +75,36 @@ class GreenWeeder:
         self.relay_response_s = self.config.getfloat('System', 'relay_response_s', fallback=0.05)
         print(f"[System] 继电器物理响应补偿: {self.relay_response_s} 秒")
 
-        # 喷头分布坐标
-        self.nozzle_x_positions = [float(x.strip()) for x in self.config.get('Nozzles', 'x_positions').split(',')]
-        print(f"[System] 喷头 X 坐标 (m): {self.nozzle_x_positions}")
-
         # 继电器映射
         relay_dict = {}
         for key, value in self.config['Relays'].items():
             relay_dict[int(key)] = int(value)
+
+        # 车道/喷头分配：将逆透视后的 X 视野均分为 lane_count 条车道，
+        # 每条车道对应一个喷头（relay）。
+        self.relay_ids = sorted(relay_dict.keys())
+        self.lane_count = self.config.getint('Nozzles', 'lane_count', fallback=len(self.relay_ids))
+        if self.lane_count <= 0:
+            self.lane_count = len(self.relay_ids)
+
+        self.fov_ground_width_m = self.config.getfloat('Nozzles', 'fov_ground_width_m', fallback=1.2)
+        half_w = self.fov_ground_width_m / 2.0
+        self.lane_x_bounds = np.linspace(-half_w, half_w, self.lane_count + 1).tolist()
+        self.nozzle_x_positions = [
+            0.5 * (self.lane_x_bounds[i] + self.lane_x_bounds[i + 1])
+            for i in range(self.lane_count)
+        ]
+
+        if len(self.relay_ids) != self.lane_count:
+            print(f"[System] 警告: relay 数量({len(self.relay_ids)}) 与 lane_count({self.lane_count}) 不一致，按较小值匹配。")
+            use_n = min(len(self.relay_ids), self.lane_count)
+            self.relay_ids = self.relay_ids[:use_n]
+            self.lane_count = use_n
+            self.lane_x_bounds = self.lane_x_bounds[:self.lane_count + 1]
+            self.nozzle_x_positions = self.nozzle_x_positions[:self.lane_count]
+
+        print(f"[System] 逆透视车道边界 X (m): {self.lane_x_bounds}")
+        print(f"[System] 车道中心/喷头 X (m): {self.nozzle_x_positions}")
             
         # 初始化终端可视化管理器
         self.vis = RelayVis(relays=len(relay_dict))
@@ -114,15 +136,23 @@ class GreenWeeder:
         self.track_stabilizer = CropMaskStabilizer(max_age=self.track_max_age)
 
     def get_nearest_nozzle(self, target_x_m: float) -> int:
-        """根据 X 坐标(向右为正)分派最近的喷头"""
-        best_idx = 0
-        min_dist = float('inf')
-        for i, nx in enumerate(self.nozzle_x_positions):
-            dist = abs(target_x_m - nx)
-            if dist < min_dist:
-                min_dist = dist
-                best_idx = i
-        return best_idx
+        """根据逆透视后的 X 坐标判断车道，并返回对应喷头 relay_id。"""
+        if self.lane_count <= 1:
+            return self.relay_ids[0]
+
+        # 落在视野外时，夹紧到最左/最右车道
+        if target_x_m <= self.lane_x_bounds[0]:
+            lane_idx = 0
+        elif target_x_m >= self.lane_x_bounds[-1]:
+            lane_idx = self.lane_count - 1
+        else:
+            lane_idx = 0
+            for i in range(self.lane_count):
+                if self.lane_x_bounds[i] <= target_x_m < self.lane_x_bounds[i + 1]:
+                    lane_idx = i
+                    break
+
+        return self.relay_ids[lane_idx]
 
     def clean_old_tracks(self):
         """清理过期的历史记录"""
