@@ -6,6 +6,8 @@ import os
 import collections
 import random
 import sys
+import threading
+from typing import Callable, Optional
 
 try:
     import gxipy as gx
@@ -13,7 +15,7 @@ except ImportError:
     gx = None
 
 # ================= 核心配置 =================
-H_MATRIX_PATH = "/home/jetson/Downloads/owl/calibration/calibration/H.npy"
+H_MATRIX_PATH = "/home/jetson/Downloads/owl/H.npy"
 DOWNSAMPLE_SCALE = 0.25  # 降采样比例，提升光流计算速度
 IMAGE_WIDTH = 2048
 IMAGE_HEIGHT = 1536
@@ -135,8 +137,8 @@ class OpticalFlowSpeedometer:
         self.prev_vy = 0.0
         self.bad_frames = 0
 
-    def update(self, frame):
-        current_time = time.time()
+    def update(self, frame, timestamp: Optional[float] = None):
+        current_time = time.time() if timestamp is None else float(timestamp)
         frame_small = cv2.resize(
             frame,
             None,
@@ -275,6 +277,79 @@ class OpticalFlowSpeedometer:
             'vis_img': vis_img,
             'good_next': good_next,
         }
+
+
+class AsyncOpticalFlowWorker:
+    """异步光流速度工作器。
+
+    - `submit_frame(frame, timestamp)` 按 FIFO 顺序缓存待处理帧，避免后台线程覆盖最新帧。
+    - 独立线程调用 `OpticalFlowSpeedometer.update`。
+    - 每次计算后通过 `on_velocity(result, timestamp)` 回调输出。
+    """
+
+    def __init__(
+        self,
+        speedometer: OpticalFlowSpeedometer,
+        on_velocity: Optional[Callable[[dict, float], None]] = None,
+        max_queue_size: int = 8,
+    ):
+        self.speedometer = speedometer
+        self.on_velocity = on_velocity
+        self._lock = threading.Lock()
+        self._frame_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._queue = collections.deque()
+        self._max_queue_size = max(1, int(max_queue_size))
+        self._dropped_frames = 0
+        self._thread = None
+
+    def start(self):
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, name='AsyncOpticalFlowWorker', daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        self._frame_event.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+    def submit_frame(self, frame, timestamp: Optional[float] = None):
+        if frame is None:
+            return
+        ts = time.time() if timestamp is None else float(timestamp)
+        with self._lock:
+            if len(self._queue) >= self._max_queue_size:
+                self._queue.popleft()
+                self._dropped_frames += 1
+            self._queue.append((frame.copy(), ts))
+        self._frame_event.set()
+
+    def _run(self):
+        while not self._stop_event.is_set():
+            self._frame_event.wait(timeout=0.1)
+            if self._stop_event.is_set():
+                break
+
+            frame = None
+            ts = None
+            with self._lock:
+                if self._queue:
+                    frame, ts = self._queue.popleft()
+                self._frame_event.clear()
+
+            if frame is None:
+                continue
+
+            try:
+                result = self.speedometer.update(frame, timestamp=ts)
+                if self.on_velocity is not None:
+                    self.on_velocity(result, ts if ts is not None else time.time())
+            except Exception:
+                # 异步线程中吞掉异常，避免线程意外退出。
+                pass
 
 def main():
     if gx is None:

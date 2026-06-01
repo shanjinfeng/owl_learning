@@ -46,6 +46,7 @@ class GroundCoordinateMapperIPM:
         self.H = np.linalg.inv(self.H_inv)
 
     # 私有方法：像素坐标转换为原始物理坐标
+    # 输入像素坐标 (u, v)，输出原始物理坐标 (x_raw, y_raw)，单位为毫米
     def _get_raw_coords(self, u: float, v: float) -> tuple[float, float]:
         w = self.H_inv[2, 0] * u + self.H_inv[2, 1] * v + self.H_inv[2, 2]
         if abs(w) < 1e-9: return 0.0, 0.0
@@ -53,6 +54,7 @@ class GroundCoordinateMapperIPM:
         y = (self.H_inv[1, 0] * u + self.H_inv[1, 1] * v + self.H_inv[1, 2]) / w
         return x, y
 
+    # 公共方法：像素坐标转换为相对地面坐标
     def pixel_to_ground(self, u: float, v: float) -> tuple[float, float]:
         """返回相对坐标 (X_right_m, Y_forward_m)"""
         p_marker = np.array(self._get_raw_coords(u, v))

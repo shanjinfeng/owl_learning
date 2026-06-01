@@ -20,7 +20,7 @@ RELAYS = {
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Jetson GPIO relay test for pins 29/31/32/33")
-    parser.add_argument("--cycles", type=int, default=3, help="完整循环次数，默认 3")
+    parser.add_argument("--cycles", type=int, default=30, help="完整循环次数，默认 30")
     parser.add_argument("--on-time", type=float, default=1.0, help="每个通道点亮时长(秒)，默认 1.0")
     parser.add_argument("--off-time", type=float, default=0.5, help="通道之间关闭等待时间(秒)，默认 0.5")
     parser.add_argument("--final-wait", type=float, default=1.0, help="结束后等待所有继电器回落的时间(秒)")

@@ -6,7 +6,7 @@ import os
 # =========================================================
 # 1. 配置
 # =========================================================
-IMAGE_DIR = "/home/jetson/Downloads/Galaxy_Linux-arm64_Gige-U3_2.4.2507.8231/Galaxy_camera/bin/png"
+IMAGE_DIR = "/home/jetson/Downloads/Galaxy_Linux-arm64_Gige-U3_2.4.2507.8231/Galaxy_camera/bin/png5.27"
 
 # 11×8 内角点（你指定）
 chessboard_size = (8, 5)

@@ -2,6 +2,12 @@ import cv2
 import time
 import logging
 from threading import Thread, Event
+'''
+主要职责: 
+为大恒（Daheng）GigE 相机提供线程化的视频帧读取与包装，
+统一输出 OpenCV 风格的 BGR numpy 帧，
+并在缺少 SDK 或相机异常时抛出自定义错误。
+'''
 
 # 移除对其他文件 (log_manager, error_manager) 的依赖
 # 自定义异常类直接在当前文件内实现
